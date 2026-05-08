@@ -1347,12 +1347,12 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.db.AddVMLog(vmID, "info", "OpenSSH server installed successfully")
+		s.db.AddVMLog(vmID, "info", "SSH install/configure step completed successfully")
 
 		// Trigger rootfs rescan to update SSH status
 		if s.rootfsScanner != nil {
 			s.rootfsScanner.TriggerScan()
-			s.db.AddVMLog(vmID, "info", "RootFS rescan triggered after SSH installation")
+			s.db.AddVMLog(vmID, "info", "RootFS rescan triggered after SSH install/configure")
 		}
 
 		s.jsonResponse(w, map[string]interface{}{
@@ -7117,6 +7117,9 @@ func (s *Server) installSSHInRootFS(rootfsPath, vmID string) error {
 		os.WriteFile(filepath.Join(mountPoint, "etc/resolv.conf"), data, 0644)
 	}
 
+	sshdConfigPath := filepath.Join(mountPoint, "etc/ssh/sshd_config")
+	sshdConfigPresent := fileExists(sshdConfigPath)
+
 	var installCmd *exec.Cmd
 	var pkgManager string
 
@@ -7130,8 +7133,8 @@ func (s *Server) installSSHInRootFS(rootfsPath, vmID string) error {
 		s.db.AddVMLog(vmID, "info", "Updating package lists...")
 		updateCmd := exec.Command("chroot", mountPoint, "apt-get", "update", "-qq")
 		updateCmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-		if output, err := updateCmd.CombinedOutput(); err != nil {
-			s.db.AddVMLog(vmID, "warning", "apt-get update warning: "+string(output))
+		if updateOut, err := updateCmd.CombinedOutput(); err != nil {
+			s.db.AddVMLog(vmID, "warning", "apt-get update warning: "+string(updateOut))
 		}
 
 		installCmd = exec.Command("chroot", mountPoint, "apt-get", "install", "-y", "-qq", "openssh-server")
@@ -7155,15 +7158,24 @@ func (s *Server) installSSHInRootFS(rootfsPath, vmID string) error {
 		s.db.AddVMLog(vmID, "info", "Detected RHEL/CentOS system, using yum")
 		installCmd = exec.Command("chroot", mountPoint, "yum", "install", "-y", "openssh-server")
 
+	} else if sshdConfigPresent {
+		s.db.AddVMLog(vmID, "warning", "No package manager detected; continuing with SSH configuration using existing /etc/ssh/sshd_config")
 	} else {
 		return fmt.Errorf("unsupported distribution: could not detect package manager")
 	}
 
-	// Run installation
-	s.db.AddVMLog(vmID, "info", fmt.Sprintf("Installing OpenSSH server using %s...", pkgManager))
-	output, err = installCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to install openssh-server: %v - %s", err, string(output))
+	if installCmd != nil {
+		s.db.AddVMLog(vmID, "info", fmt.Sprintf("Installing OpenSSH server using %s...", pkgManager))
+		installOut, installErr := installCmd.CombinedOutput()
+		if installErr != nil {
+			s.db.AddVMLog(vmID, "warning", fmt.Sprintf("openssh-server package install failed: %v - %s", installErr, string(installOut)))
+			if !sshdConfigPresent {
+				return fmt.Errorf("failed to install openssh-server: %v - %s", installErr, string(installOut))
+			}
+			s.db.AddVMLog(vmID, "info", "Continuing with SSH host configuration (sshd_config present)")
+		}
+	} else if sshdConfigPresent {
+		s.db.AddVMLog(vmID, "info", "Skipping package installation; configuring SSH from existing /etc/ssh/sshd_config")
 	}
 
 	// Install haveged for entropy (prevents systemd-random-seed.service hang)
@@ -7219,34 +7231,35 @@ func (s *Server) installSSHInRootFS(rootfsPath, vmID string) error {
 		exec.Command("chroot", mountPoint, "ssh-keygen", "-A").Run()
 	}
 
-	// Ensure sshd_config allows password authentication
+	// Ensure sshd_config allows password authentication and root password login (idempotent)
 	sshdConfig := filepath.Join(sshKeyDir, "sshd_config")
 	if data, err := os.ReadFile(sshdConfig); err == nil {
-		config := string(data)
-		modified := false
-
-		// Enable password authentication
-		if strings.Contains(config, "#PasswordAuthentication") {
-			config = strings.ReplaceAll(config, "#PasswordAuthentication no", "PasswordAuthentication yes")
-			config = strings.ReplaceAll(config, "#PasswordAuthentication yes", "PasswordAuthentication yes")
-			modified = true
-		}
-
-		// Enable root login (for initial access)
-		if strings.Contains(config, "#PermitRootLogin") {
-			config = strings.ReplaceAll(config, "#PermitRootLogin prohibit-password", "PermitRootLogin yes")
-			config = strings.ReplaceAll(config, "#PermitRootLogin yes", "PermitRootLogin yes")
-			modified = true
-		}
-
+		config, modified := patchSSHDConfigForRootPasswordLogin(string(data))
 		if modified {
 			os.WriteFile(sshdConfig, []byte(config), 0644)
 			s.db.AddVMLog(vmID, "info", "Updated sshd_config to allow password authentication")
 		}
 	}
 
-	s.db.AddVMLog(vmID, "info", "OpenSSH server installation completed")
+	s.db.AddVMLog(vmID, "info", "OpenSSH server install/configure completed")
 	return nil
+}
+
+// patchSSHDConfigForRootPasswordLogin applies idempotent edits for password and root login.
+// Handles common commented defaults and active lines (e.g. Ubuntu's PermitRootLogin prohibit-password).
+func patchSSHDConfigForRootPasswordLogin(config string) (string, bool) {
+	orig := config
+	// Commented Debian/Ubuntu defaults
+	config = strings.ReplaceAll(config, "#PasswordAuthentication no", "PasswordAuthentication yes")
+	config = strings.ReplaceAll(config, "#PasswordAuthentication yes", "PasswordAuthentication yes")
+	config = strings.ReplaceAll(config, "#PermitRootLogin prohibit-password", "PermitRootLogin yes")
+	config = strings.ReplaceAll(config, "#PermitRootLogin yes", "PermitRootLogin yes")
+	// Active lines
+	config = strings.ReplaceAll(config, "PasswordAuthentication no", "PasswordAuthentication yes")
+	config = strings.ReplaceAll(config, "PermitRootLogin prohibit-password", "PermitRootLogin yes")
+	config = strings.ReplaceAll(config, "PermitRootLogin without-password", "PermitRootLogin yes")
+	config = strings.ReplaceAll(config, "PermitRootLogin no", "PermitRootLogin yes")
+	return config, config != orig
 }
 
 // fileExists checks if a file exists
