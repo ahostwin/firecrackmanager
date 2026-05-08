@@ -590,6 +590,119 @@ func (m *Manager) cleanupFailedStart(vmID string) {
 	time.Sleep(200 * time.Millisecond)
 }
 
+// attachVMNetworkTaps creates TAP devices and attaches them to bridges; same rules as startVMInternal.
+// Caller must hold m.mu. On failure, any TAPs created in this call are removed.
+func (m *Manager) attachVMNetworkTaps(vmID string, vm *database.VM) error {
+	vmNetworks, err := m.db.ListVMNetworks(vmID)
+	if err != nil {
+		m.db.AddVMLog(vmID, "warning", fmt.Sprintf("Failed to list VM networks: %v", err))
+		vmNetworks = nil
+	}
+
+	if len(vmNetworks) == 0 && vm.NetworkID != "" && vm.TapDevice != "" {
+		vmNetworks = []*database.VMNetwork{{
+			ID:         "legacy",
+			VMID:       vmID,
+			NetworkID:  vm.NetworkID,
+			IfaceIndex: 0,
+			MacAddress: vm.MacAddress,
+			IPAddress:  vm.IPAddress,
+			TapDevice:  vm.TapDevice,
+		}}
+	}
+
+	var createdTAPs []string
+	if len(vmNetworks) > 0 {
+		m.db.AddVMLog(vmID, "info", fmt.Sprintf("Setting up %d network interface(s)", len(vmNetworks)))
+
+		for _, vmNet := range vmNetworks {
+			m.db.AddVMLog(vmID, "info", fmt.Sprintf("Setting up network eth%d: TAP=%s, NetworkID=%s", vmNet.IfaceIndex, vmNet.TapDevice, vmNet.NetworkID))
+
+			m.netMgr.DeleteTAP(vmNet.TapDevice)
+			time.Sleep(100 * time.Millisecond)
+
+			if _, err := m.netMgr.CreateTAP(vmNet.TapDevice); err != nil {
+				m.db.AddVMLog(vmID, "error", fmt.Sprintf("Failed to create TAP device %s: %v", vmNet.TapDevice, err))
+				for _, tap := range createdTAPs {
+					m.netMgr.DeleteTAP(tap)
+				}
+				return fmt.Errorf("failed to create TAP device %s: %w", vmNet.TapDevice, err)
+			}
+			createdTAPs = append(createdTAPs, vmNet.TapDevice)
+			m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s created", vmNet.TapDevice))
+
+			tapUp := false
+			for i := 0; i < 3; i++ {
+				if err := m.netMgr.SetInterfaceUp(vmNet.TapDevice); err != nil {
+					if i == 2 {
+						m.db.AddVMLog(vmID, "error", fmt.Sprintf("Failed to bring TAP device %s up after 3 attempts: %v", vmNet.TapDevice, err))
+						for _, tap := range createdTAPs {
+							m.netMgr.DeleteTAP(tap)
+						}
+						return fmt.Errorf("failed to bring TAP device %s up after 3 attempts: %w", vmNet.TapDevice, err)
+					}
+					m.db.AddVMLog(vmID, "warning", fmt.Sprintf("TAP device %s up attempt %d failed, retrying...", vmNet.TapDevice, i+1))
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				tapUp = true
+				break
+			}
+			if tapUp {
+				m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s is up", vmNet.TapDevice))
+			}
+
+			net, netErr := m.db.GetNetwork(vmNet.NetworkID)
+			if netErr == nil && net != nil {
+				if err := m.netMgr.AddInterfaceToBridge(net.BridgeName, vmNet.TapDevice); err != nil {
+					m.db.AddVMLog(vmID, "warning", fmt.Sprintf("Failed to add TAP %s to bridge %s: %v", vmNet.TapDevice, net.BridgeName, err))
+					m.logger("Warning: failed to add TAP %s to bridge %s: %v", vmNet.TapDevice, net.BridgeName, err)
+				} else {
+					m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s added to bridge %s", vmNet.TapDevice, net.BridgeName))
+				}
+			}
+		}
+	} else {
+		m.db.AddVMLog(vmID, "info", "No network configured for this VM")
+	}
+
+	return nil
+}
+
+// teardownHostNetworking removes TAP devices from bridges and deletes them according to VM network config.
+// Caller must hold m.mu.
+func (m *Manager) teardownHostNetworking(vmID string, vm *database.VM) {
+	if vm == nil {
+		return
+	}
+	vmNetworks, err := m.db.ListVMNetworks(vmID)
+	if err != nil {
+		vmNetworks = nil
+	}
+
+	if len(vmNetworks) == 0 && vm.NetworkID != "" && vm.TapDevice != "" {
+		vmNetworks = []*database.VMNetwork{{
+			ID:         "legacy",
+			VMID:       vmID,
+			NetworkID:  vm.NetworkID,
+			IfaceIndex: 0,
+			MacAddress: vm.MacAddress,
+			IPAddress:  vm.IPAddress,
+			TapDevice:  vm.TapDevice,
+		}}
+	}
+
+	for _, vmNet := range vmNetworks {
+		if vmNet.TapDevice == "" {
+			continue
+		}
+		if net, netErr := m.db.GetNetwork(vmNet.NetworkID); netErr == nil && net != nil {
+			m.netMgr.RemoveInterfaceFromBridge(net.BridgeName, vmNet.TapDevice)
+		}
+		m.netMgr.DeleteTAP(vmNet.TapDevice)
+	}
+}
+
 // startVMInternal is the internal VM start implementation
 func (m *Manager) startVMInternal(vmID string) error {
 	m.mu.Lock()
@@ -680,92 +793,11 @@ func (m *Manager) startVMInternal(vmID string) error {
 		m.db.AddVMLog(vmID, "info", "Starting VM in standard mode (no jailer)")
 	}
 
-	// Get VM networks from the new vm_networks table
-	vmNetworks, err := m.db.ListVMNetworks(vmID)
-	if err != nil {
-		m.db.AddVMLog(vmID, "warning", fmt.Sprintf("Failed to list VM networks: %v", err))
-		vmNetworks = nil
-	}
-
-	// Fallback to legacy single-network fields if no vm_networks entries exist
-	if len(vmNetworks) == 0 && vm.NetworkID != "" && vm.TapDevice != "" {
-		vmNetworks = []*database.VMNetwork{{
-			ID:         "legacy",
-			VMID:       vmID,
-			NetworkID:  vm.NetworkID,
-			IfaceIndex: 0,
-			MacAddress: vm.MacAddress,
-			IPAddress:  vm.IPAddress,
-			TapDevice:  vm.TapDevice,
-		}}
-	}
-
-	// Create TAP devices for each network interface
-	var createdTAPs []string
-	if len(vmNetworks) > 0 {
-		m.db.AddVMLog(vmID, "info", fmt.Sprintf("Setting up %d network interface(s)", len(vmNetworks)))
-
-		for _, vmNet := range vmNetworks {
-			m.db.AddVMLog(vmID, "info", fmt.Sprintf("Setting up network eth%d: TAP=%s, NetworkID=%s", vmNet.IfaceIndex, vmNet.TapDevice, vmNet.NetworkID))
-
-			// Pre-cleanup: ensure no stale TAP device exists
-			m.netMgr.DeleteTAP(vmNet.TapDevice)
-			time.Sleep(100 * time.Millisecond) // Give kernel time to clean up
-
-			_, err := m.netMgr.CreateTAP(vmNet.TapDevice)
-			if err != nil {
-				m.db.AddVMLog(vmID, "error", fmt.Sprintf("Failed to create TAP device %s: %v", vmNet.TapDevice, err))
-				// Cleanup already created TAPs
-				for _, tap := range createdTAPs {
-					m.netMgr.DeleteTAP(tap)
-				}
-				if useJailer {
-					m.cleanupJail(vmID)
-				}
-				return fmt.Errorf("failed to create TAP device %s: %w", vmNet.TapDevice, err)
-			}
-			createdTAPs = append(createdTAPs, vmNet.TapDevice)
-			m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s created", vmNet.TapDevice))
-
-			// Bring TAP device up with retry
-			tapUp := false
-			for i := 0; i < 3; i++ {
-				if err := m.netMgr.SetInterfaceUp(vmNet.TapDevice); err != nil {
-					if i == 2 {
-						m.db.AddVMLog(vmID, "error", fmt.Sprintf("Failed to bring TAP device %s up after 3 attempts: %v", vmNet.TapDevice, err))
-						// Cleanup all created TAPs
-						for _, tap := range createdTAPs {
-							m.netMgr.DeleteTAP(tap)
-						}
-						if useJailer {
-							m.cleanupJail(vmID)
-						}
-						return fmt.Errorf("failed to bring TAP device %s up after 3 attempts: %w", vmNet.TapDevice, err)
-					}
-					m.db.AddVMLog(vmID, "warning", fmt.Sprintf("TAP device %s up attempt %d failed, retrying...", vmNet.TapDevice, i+1))
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-				tapUp = true
-				break
-			}
-			if tapUp {
-				m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s is up", vmNet.TapDevice))
-			}
-
-			// Add TAP to bridge
-			net, err := m.db.GetNetwork(vmNet.NetworkID)
-			if err == nil && net != nil {
-				if err := m.netMgr.AddInterfaceToBridge(net.BridgeName, vmNet.TapDevice); err != nil {
-					m.db.AddVMLog(vmID, "warning", fmt.Sprintf("Failed to add TAP %s to bridge %s: %v", vmNet.TapDevice, net.BridgeName, err))
-					m.logger("Warning: failed to add TAP %s to bridge %s: %v", vmNet.TapDevice, net.BridgeName, err)
-				} else {
-					m.db.AddVMLog(vmID, "info", fmt.Sprintf("TAP device %s added to bridge %s", vmNet.TapDevice, net.BridgeName))
-				}
-			}
+	if err := m.attachVMNetworkTaps(vmID, vm); err != nil {
+		if useJailer {
+			m.cleanupJail(vmID)
 		}
-	} else {
-		m.db.AddVMLog(vmID, "info", "No network configured for this VM")
+		return err
 	}
 
 	// Create context for process management
@@ -2650,10 +2682,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		if rv.cancel != nil {
 			rv.cancel()
 		}
-		// Cleanup TAP device
-		if vm.TapDevice != "" {
-			m.netMgr.DeleteTAP(vm.TapDevice)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		// Remove socket
 		os.Remove(rv.socketPath)
 		delete(m.runningVMs, vmID)
@@ -2663,6 +2692,10 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 
 	// Start VM from snapshot
 	m.logger("Restoring VM %s from snapshot %s...", vmID, snapshotID)
+
+	if err := m.attachVMNetworkTaps(vmID, vm); err != nil {
+		return fmt.Errorf("failed to set up host networking for restore: %w", err)
+	}
 
 	// Create socket path
 	socketPath := filepath.Join(m.socketDir, fmt.Sprintf("%s.sock", vmID))
@@ -2683,6 +2716,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 
@@ -2690,6 +2724,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 	if err != nil {
 		cancel()
 		stdinPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
@@ -2701,6 +2736,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cancel()
 		stdinPipe.Close()
 		stdoutPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to start firecracker: %w", err)
 	}
 
@@ -2709,6 +2745,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cancel()
 		cmd.Process.Kill()
 		cmd.Wait()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("firecracker socket not ready: %w", err)
 	}
 
@@ -2737,6 +2774,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cmd.Wait()
 		stdinPipe.Close()
 		stdoutPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to marshal snapshot load request: %w", err)
 	}
 
@@ -2747,6 +2785,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cmd.Wait()
 		stdinPipe.Close()
 		stdoutPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -2758,6 +2797,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cmd.Wait()
 		stdinPipe.Close()
 		stdoutPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("failed to load snapshot: %w", err)
 	}
 	defer resp.Body.Close()
@@ -2769,6 +2809,7 @@ func (m *Manager) RestoreSnapshot(vmID, snapshotID string) error {
 		cmd.Wait()
 		stdinPipe.Close()
 		stdoutPipe.Close()
+		m.teardownHostNetworking(vmID, vm)
 		return fmt.Errorf("snapshot load API error %d: %s", resp.StatusCode, string(body))
 	}
 
