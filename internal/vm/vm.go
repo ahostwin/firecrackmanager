@@ -831,9 +831,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
@@ -845,9 +843,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 	if err != nil {
 		cancel()
 		stdinPipe.Close()
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
@@ -864,9 +860,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 		cancel()
 		stdinPipe.Close()
 		stdoutPipe.Close()
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
@@ -886,9 +880,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 		cmd.Process.Kill()
 		cmd.Wait()
 		os.Remove(actualSocketPath)
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
@@ -910,9 +902,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 		cmd.Process.Kill()
 		cmd.Wait()
 		os.Remove(actualSocketPath)
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
@@ -944,9 +934,7 @@ func (m *Manager) startVMInternal(vmID string) error {
 		cmd.Process.Kill()
 		cmd.Wait()
 		os.Remove(actualSocketPath)
-		for _, tap := range createdTAPs {
-			m.netMgr.DeleteTAP(tap)
-		}
+		m.teardownHostNetworking(vmID, vm)
 		if useJailer {
 			m.cleanupJail(vmID)
 		}
